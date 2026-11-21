@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
-using System.Globalization;
+using System.Text.Json;
 using CurrencyConverter.Core.Models;
 using Microsoft.Extensions.Caching.Memory;
 
@@ -8,18 +10,17 @@ namespace CurrencyConverter.Server;
 
 public class CbrRatesService
 {
-    private readonly HttpClient httpClient = new()
-    {
-        BaseAddress = new Uri("https://www.cbr-xml-daily.ru/"),
-        Timeout = TimeSpan.FromSeconds(20)
-    };
+    private readonly IHttpClientFactory clients;
     private readonly IMemoryCache cache;
-    private readonly SemaphoreSlim requestLock = new(1, 1);
-    private DateTime nextRequest = DateTime.MinValue;
+    private readonly IHostApplicationLifetime lifetime;
+    private readonly ConcurrentDictionary<string, Lazy<Task<CbrResponse?>>> loading = new();
 
-    public CbrRatesService(IMemoryCache cache)
+    public CbrRatesService(IHttpClientFactory clients, IMemoryCache cache,
+        IHostApplicationLifetime lifetime)
     {
+        this.clients = clients;
         this.cache = cache;
+        this.lifetime = lifetime;
     }
 
     public async Task<Rates> GetRatesAsync(DateTime selectedDate, CancellationToken token)
@@ -46,7 +47,6 @@ public class CbrRatesService
                 }
                 return result;
             }
-
             if (date == DateTime.MinValue.Date) break;
             date = date.AddDays(-1);
         }
@@ -58,18 +58,20 @@ public class CbrRatesService
         string key = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         if (cache.TryGetValue(key, out CbrResponse? saved)) return saved;
 
-        await requestLock.WaitAsync(token);
+        var task = loading.GetOrAdd(key,
+            _ => new Lazy<Task<CbrResponse?>>(() => LoadDayAsync(date, key)));
+        return await task.Value.WaitAsync(token);
+    }
+
+    private async Task<CbrResponse?> LoadDayAsync(DateTime date, string key)
+    {
+        string path = "archive/" + date.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)
+            + "/daily_json.js";
         try
         {
-            if (cache.TryGetValue(key, out saved)) return saved;
-
-            var delay = nextRequest - DateTime.UtcNow;
-            if (delay > TimeSpan.Zero) await Task.Delay(delay, token);
-            nextRequest = DateTime.UtcNow.AddSeconds(2.1);
-
-            string path = "archive/" + date.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)
-                + "/daily_json.js";
-            using var response = await httpClient.GetAsync(path, token);
+            if (cache.TryGetValue(key, out CbrResponse? saved)) return saved;
+            using var client = clients.CreateClient("cbr");
+            using var response = await client.GetAsync(path, lifetime.ApplicationStopping);
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
                 cache.Set<CbrResponse?>(key, null, TimeSpan.FromHours(1));
@@ -77,7 +79,7 @@ public class CbrRatesService
             }
 
             response.EnsureSuccessStatusCode();
-            var data = await response.Content.ReadFromJsonAsync<CbrResponse>(token);
+            var data = await response.Content.ReadFromJsonAsync<CbrResponse>(lifetime.ApplicationStopping);
             if (data == null || data.Date == default || data.Date.Date > date ||
                 data.Valute.Count == 0 ||
                 data.Valute.Values.Any(c => c.Nominal <= 0 || c.Value <= 0 ||
@@ -87,9 +89,23 @@ public class CbrRatesService
             cache.Set(key, data, TimeSpan.FromHours(12));
             return data;
         }
+        catch (Exception error) when (error is HttpRequestException or JsonException or InvalidDataException)
+        {
+            throw new CbrSourceException(date, path, error);
+        }
+        catch (OperationCanceledException error) when (!lifetime.ApplicationStopping.IsCancellationRequested)
+        {
+            throw new CbrSourceException(date, path, error);
+        }
         finally
         {
-            requestLock.Release();
+            loading.TryRemove(key, out _);
         }
     }
+}
+
+public class CbrSourceException : Exception
+{
+    public CbrSourceException(DateTime date, string path, Exception innerException)
+        : base($"Ошибка источника за {date:yyyy-MM-dd}: https://www.cbr-xml-daily.ru/{path}", innerException) { }
 }

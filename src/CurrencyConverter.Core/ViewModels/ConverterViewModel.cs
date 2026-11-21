@@ -26,6 +26,7 @@ public class ConverterViewModel : INotifyPropertyChanged
     }
 
     public bool IsBusy { get; private set; }
+    public Task CurrentLoad { get; private set; } = Task.CompletedTask;
     public bool CanEdit => !IsBusy;
     public DateTime MaximumDate => DateTime.Today;
     public string ErrorMessage { get; private set; } = "";
@@ -52,7 +53,7 @@ public class ConverterViewModel : INotifyPropertyChanged
         {
             if (IsBusy || state.SelectedDate == value.Date) return;
             state.SelectedDate = value.Date;
-            if (initialized) _ = LoadRatesAsync();
+            if (initialized) CurrentLoad = LoadRatesAsync();
             else Notify();
         }
     }
@@ -115,7 +116,8 @@ public class ConverterViewModel : INotifyPropertyChanged
         {
             state = new SavedState();
         }
-        await LoadRatesAsync();
+        CurrentLoad = LoadRatesAsync();
+        await CurrentLoad;
     }
 
     public async Task LoadRatesAsync()
@@ -129,6 +131,10 @@ public class ConverterViewModel : INotifyPropertyChanged
             state.Rates = await ratesService.GetRatesAsync(SelectedDate);
             if (FromCurrency == null) state.FromCode = Currencies[0].Code;
             if (ToCurrency == null) state.ToCode = Currencies[0].Code;
+        }
+        catch (RatesApiException error)
+        {
+            ErrorMessage = error.Message;
         }
         catch (Exception)
         {
